@@ -109,7 +109,7 @@ ssh-copy-id ubuntu@your-server.com
 ## Usage
 
 ```bash
-# Launch Claude with remote execution (defaults to langwatch-saas/langwatch)
+# Launch Claude with remote execution (uses DEFAULT_PROJECT from config)
 claude-remote
 
 # Or specify a path
@@ -149,6 +149,9 @@ REMOTE_DIR="/home/ubuntu/Projects"
 
 # Local directory to sync with remote
 LOCAL_MOUNT="$HOME/Projects/remote"
+
+# Default project directory (optional, defaults to LOCAL_MOUNT)
+DEFAULT_PROJECT="$LOCAL_MOUNT/my-project"
 ```
 
 ### Sync ignore patterns

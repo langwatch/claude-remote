@@ -25,7 +25,7 @@ if [[ -n "$1" && -d "$1" ]]; then
     WORK_PATH="$1"
     shift
 else
-    WORK_PATH="$LOCAL_MOUNT/langwatch-saas/langwatch"
+    WORK_PATH="${DEFAULT_PROJECT:-$LOCAL_MOUNT}"
 fi
 
 # Launch Claude with remote shell
