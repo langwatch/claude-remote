@@ -19,5 +19,5 @@ source "$SCRIPT_DIR/../config.sh" 2>/dev/null || {
 
 SESSION_NAME="${1:-main}"
 
-exec ssh -t "$REMOTE_HOST" "cd $REMOTE_DIR/langwatch-saas/langwatch && tmux new-session -A -s $SESSION_NAME"
+exec ssh -t "$REMOTE_HOST" "cd $REMOTE_DIR && tmux new-session -A -s $SESSION_NAME"
 
