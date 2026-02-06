@@ -18,7 +18,7 @@ source "$SCRIPT_DIR/../config.sh" 2>/dev/null || {
     exit 1
 }
 
-SSH_OPTS="-o ControlMaster=auto -o ControlPath=/tmp/ssh-claude-%r@%h:%p -o ControlPersist=600 -o ConnectTimeout=2"
+SSH_OPTS="-o ControlMaster=auto -o ControlPath=/tmp/ssh-claude-%r@%h:%p -o ControlPersist=600 -o ConnectTimeout=5"
 STATE_FILE="/tmp/claude-remote-state"
 NOTIFY_COOLDOWN=300  # 5 minutes
 
@@ -62,8 +62,8 @@ is_remote_available() {
             /bin/rm -f "$socket" 2>/dev/null
         fi
     fi
-    # Hard 2-second timeout wrapper
-    timeout 2 /usr/bin/ssh $SSH_OPTS -o BatchMode=yes "$REMOTE_HOST" "exit 0" 2>/dev/null
+    # Plain SSH check without ControlMaster (ControlMaster=auto can hang when creating socket)
+    timeout 5 /usr/bin/ssh -o ConnectTimeout=5 -o BatchMode=yes "$REMOTE_HOST" "exit 0" 2>/dev/null
 }
 
 # Parse flags - Claude Code sends: -c -l "command"
