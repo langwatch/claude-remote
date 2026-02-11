@@ -53,13 +53,11 @@ mkdir -p "$BIN_DIR"
 # Create symlinks
 echo "Creating symlinks in $BIN_DIR..."
 
-ln -sf "$SCRIPT_DIR/scripts/claude-remote.sh" "$BIN_DIR/claude-remote"
-ln -sf "$SCRIPT_DIR/scripts/mount-remote.sh" "$BIN_DIR/mount-remote"
-ln -sf "$SCRIPT_DIR/scripts/unmount-remote.sh" "$BIN_DIR/unmount-remote"
-
-echo "✓ claude-remote -> scripts/claude-remote.sh"
-echo "✓ mount-remote -> scripts/mount-remote.sh"
-echo "✓ unmount-remote -> scripts/unmount-remote.sh"
+COMMANDS=(claude-remote mount-remote unmount-remote sync-start sync-status sync-stop ssh-tmux ssh-wait remote-status)
+for cmd in "${COMMANDS[@]}"; do
+    ln -sf "$SCRIPT_DIR/scripts/${cmd}.sh" "$BIN_DIR/$cmd"
+    echo "  $cmd -> scripts/${cmd}.sh"
+done
 
 echo
 
@@ -107,3 +105,9 @@ echo "Usage:"
 echo "  claude-remote          # Launch Claude with remote execution"
 echo "  mount-remote           # Mount remote filesystem only"
 echo "  unmount-remote         # Unmount remote filesystem"
+echo "  sync-start [path]      # Start Mutagen sync for a project"
+echo "  sync-status            # Show Mutagen sync status"
+echo "  sync-stop              # Stop Mutagen sync"
+echo "  ssh-tmux               # SSH into remote with tmux"
+echo "  ssh-wait               # Wait for remote, then connect"
+echo "  remote-status          # Diagnostic status check"
