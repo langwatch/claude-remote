@@ -21,6 +21,9 @@ source "$SCRIPT_DIR/../config.sh" 2>/dev/null || {
 if [[ -n "$1" && -d "$1" ]]; then
     WORK_PATH="$1"
     shift
+elif [[ $# -gt 0 ]]; then
+    # Args passed (e.g. --resume), respect current directory
+    WORK_PATH="$(pwd -P)"
 else
     WORK_PATH="${DEFAULT_PROJECT:-$(pwd)}"
 fi
