@@ -31,6 +31,10 @@ fi
 # Ensure mutagen sync is running for this project
 "$SCRIPT_DIR/sync-start.sh" "$WORK_PATH"
 
+# Check remote shell connection
+echo "Remote shell connection:"
+"$SCRIPT_DIR/remote-shell.sh" -c "uname -a"
+
 # Launch Claude with remote shell
 cd "$WORK_PATH"
 SHELL="$SCRIPT_DIR/zsh" exec claude --dangerously-skip-permissions "$@"
