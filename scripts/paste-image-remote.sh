@@ -20,7 +20,7 @@ source "$SCRIPT_DIR/../config.sh" 2>/dev/null || {
 SESSION_NAME="${1:-}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOCAL_TMP="/tmp/clipboard_${TIMESTAMP}.png"
-REMOTE_CACHE="/home/ubuntu/.cache/tmux-paste-image"
+REMOTE_CACHE="${REMOTE_IMAGE_CACHE:-/home/ubuntu/.cache/tmux-paste-image}"
 REMOTE_PATH="${REMOTE_CACHE}/clipboard_${TIMESTAMP}.png"
 
 # Get image from Mac clipboard using pngpaste (or osascript fallback)

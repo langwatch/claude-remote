@@ -18,7 +18,7 @@ source "$SCRIPT_DIR/../config.sh" 2>/dev/null || {
     exit 1
 }
 
-SSH_OPTS="-o ControlMaster=auto -o ControlPath=/tmp/ssh-claude-%r@%h:%p -o ControlPersist=600 -o ConnectTimeout=2"
+SSH_OPTS="-o ControlMaster=auto -o ControlPath=/tmp/ssh-claude-%r@%h:%p -o ControlPersist=600 -o ConnectTimeout=5"
 STATE_FILE="/tmp/claude-remote-state"
 NOTIFY_COOLDOWN=300  # 5 minutes
 
@@ -52,18 +52,17 @@ notify() {
     fi
 }
 
-# Check if remote is reachable (fast check with hard timeout)
+# Check if remote is reachable (fast check via SSH ConnectTimeout)
 is_remote_available() {
     # First check if control socket exists but is stale
     local socket="/tmp/ssh-claude-${REMOTE_HOST}:22"
     if [[ -S "$socket" ]]; then
         # Test if socket is alive, remove if stale
-        if ! timeout 1 /usr/bin/ssh -o ControlPath="$socket" -O check "$REMOTE_HOST" 2>/dev/null; then
+        if ! /usr/bin/ssh -o ControlPath="$socket" -o ConnectTimeout=1 -O check "$REMOTE_HOST" 2>/dev/null; then
             /bin/rm -f "$socket" 2>/dev/null
         fi
     fi
-    # Hard 2-second timeout wrapper
-    timeout 2 /usr/bin/ssh $SSH_OPTS -o BatchMode=yes "$REMOTE_HOST" "exit 0" 2>/dev/null
+    /usr/bin/ssh -o ConnectTimeout=5 -o BatchMode=yes "$REMOTE_HOST" "exit 0" 2>/dev/null
 }
 
 # Parse flags - Claude Code sends: -c -l "command"
@@ -101,7 +100,9 @@ if [[ -n "$cmd" ]]; then
         # Build remote command
         # Source .profile and .bashrc (with non-interactive guard disabled)
         MARKER="__CLAUDE_REMOTE_PWD__"
-        remote_cmd="source ~/.profile 2>/dev/null; source <(sed 's/return;;/;;/' ~/.bashrc) 2>/dev/null; cd '$REMOTE_CWD' 2>/dev/null || cd '$REMOTE_DIR'; /bin/bash -c $(printf '%q' "$cmd"); echo $MARKER; pwd -P"
+        # Heal worktree .git file on remote if needed (sync may have overwritten with local paths)
+        HEAL_CMD="[[ -f '$REMOTE_CWD/.git' ]] && grep -q '$LOCAL_MOUNT' '$REMOTE_CWD/.git' 2>/dev/null && sed -i 's|$LOCAL_MOUNT|$REMOTE_DIR|g' '$REMOTE_CWD/.git';"
+        remote_cmd="source ~/.profile 2>/dev/null; source <(sed 's/return;;/;;/' ~/.bashrc) 2>/dev/null; $HEAL_CMD cd '$REMOTE_CWD' 2>/dev/null || cd '$REMOTE_DIR'; /bin/bash -c $(printf '%q' "$cmd"); echo $MARKER; pwd -P"
 
         # Run and capture output
         remote_output=$(/usr/bin/ssh $SSH_OPTS "$REMOTE_HOST" "$remote_cmd")
@@ -109,6 +110,11 @@ if [[ -n "$cmd" ]]; then
 
         # Flush mutagen sync after command
         mutagen sync flush --label-selector=name=claude-remote >/dev/null 2>&1
+
+        # Heal git worktree paths in cwd (sync may have overwritten .git file)
+        if [[ -f "$LOCAL_CWD/.git" ]] && grep -q "$REMOTE_DIR" "$LOCAL_CWD/.git" 2>/dev/null; then
+            sed -i '' "s|$REMOTE_DIR|$LOCAL_MOUNT|g" "$LOCAL_CWD/.git"
+        fi
 
         # Split output and handle pwd
         if [[ "$remote_output" == *"$MARKER"* ]]; then
