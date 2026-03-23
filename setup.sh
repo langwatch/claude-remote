@@ -72,12 +72,12 @@ fi
 # Check dependencies
 echo "Checking dependencies..."
 
-if ! command -v sshfs &> /dev/null; then
-    echo "⚠ sshfs not found. Install with:"
-    echo "  brew install --cask fuse-t"
-    echo "  brew install macos-fuse-t/cask/fuse-t-sshfs"
+if ! command -v mutagen &> /dev/null; then
+    echo "⚠ mutagen not found. Install with:"
+    echo "  brew install mutagen-io/mutagen/mutagen"
+    echo "  or: port install mutagen"
 else
-    echo "✓ sshfs installed"
+    echo "✓ mutagen installed"
 fi
 
 if ! command -v claude &> /dev/null; then
