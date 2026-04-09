@@ -22,10 +22,9 @@ echo
 echo "Config:"
 if [[ -f "$SCRIPT_DIR/../config.sh" ]]; then
     source "$SCRIPT_DIR/../config.sh"
-    echo "  REMOTE_HOST:     ${REMOTE_HOST:-<not set>}"
-    echo "  REMOTE_DIR:      ${REMOTE_DIR:-<not set>}"
-    echo "  LOCAL_MOUNT:     ${LOCAL_MOUNT:-<not set>}"
-    echo "  DEFAULT_PROJECT: ${DEFAULT_PROJECT:-<not set>}"
+    echo "  REMOTE_HOST:       ${REMOTE_HOST:-<not set>}"
+    echo "  REMOTE_DIR:        ${REMOTE_DIR:-<not set>}"
+    echo "  REMOTE_MIRROR_ROOT: ${REMOTE_MIRROR_ROOT:-<not set>}"
 else
     echo "  ERROR: config.sh not found. Run ./setup.sh first."
 fi
@@ -49,7 +48,7 @@ echo
 # --- ~/bin symlinks ---
 echo "~/bin symlinks:"
 BIN_DIR="$HOME/bin"
-for cmd in claude-remote mount-remote unmount-remote sync-start sync-status sync-stop ssh-tmux ssh-wait remote-status; do
+for cmd in claude-remote sync-start sync-status sync-stop ssh-tmux ssh-wait remote-status paste-image-remote; do
     link="$BIN_DIR/$cmd"
     if [[ -L "$link" ]]; then
         target="$(readlink "$link")"

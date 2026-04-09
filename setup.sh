@@ -19,12 +19,9 @@ if [[ ! -f "$SCRIPT_DIR/config.sh" ]]; then
 
     # Prompt for values
     read -p "Remote SSH host (e.g., ubuntu@your-server.com): " REMOTE_HOST
-    read -p "Remote directory (e.g., /home/ubuntu/Projects): " REMOTE_DIR
-    read -p "Local mount point [~/Projects/remote]: " LOCAL_MOUNT
-    LOCAL_MOUNT="${LOCAL_MOUNT:-$HOME/Projects/remote}"
-
-    # Expand ~ in LOCAL_MOUNT
-    LOCAL_MOUNT="${LOCAL_MOUNT/#\~/$HOME}"
+    read -p "Remote working directory (e.g., /home/ubuntu/Projects): " REMOTE_DIR
+    read -p "Remote mirror root [/home/ubuntu/mirror]: " REMOTE_MIRROR_ROOT
+    REMOTE_MIRROR_ROOT="${REMOTE_MIRROR_ROOT:-/home/ubuntu/mirror}"
 
     cat > "$SCRIPT_DIR/config.sh" << EOF
 # Claude Remote Configuration
@@ -32,7 +29,7 @@ if [[ ! -f "$SCRIPT_DIR/config.sh" ]]; then
 
 REMOTE_HOST="$REMOTE_HOST"
 REMOTE_DIR="$REMOTE_DIR"
-LOCAL_MOUNT="$LOCAL_MOUNT"
+REMOTE_MIRROR_ROOT="$REMOTE_MIRROR_ROOT"
 EOF
 
     echo
@@ -53,10 +50,12 @@ mkdir -p "$BIN_DIR"
 # Create symlinks
 echo "Creating symlinks in $BIN_DIR..."
 
-COMMANDS=(claude-remote mount-remote unmount-remote sync-start sync-status sync-stop ssh-tmux ssh-wait remote-status)
+COMMANDS=(claude-remote sync-start sync-status sync-stop ssh-tmux ssh-wait remote-status paste-image-remote)
 for cmd in "${COMMANDS[@]}"; do
-    ln -sf "$SCRIPT_DIR/scripts/${cmd}.sh" "$BIN_DIR/$cmd"
-    echo "  $cmd -> scripts/${cmd}.sh"
+    if [[ -f "$SCRIPT_DIR/scripts/${cmd}.sh" ]]; then
+        ln -sf "$SCRIPT_DIR/scripts/${cmd}.sh" "$BIN_DIR/$cmd"
+        echo "  $cmd -> scripts/${cmd}.sh"
+    fi
 done
 
 echo
@@ -72,12 +71,10 @@ fi
 # Check dependencies
 echo "Checking dependencies..."
 
-if ! command -v sshfs &> /dev/null; then
-    echo "⚠ sshfs not found. Install with:"
-    echo "  brew install --cask fuse-t"
-    echo "  brew install macos-fuse-t/cask/fuse-t-sshfs"
+if ! command -v mutagen &> /dev/null; then
+    echo "⚠ mutagen not found. Install with: brew install mutagen-io/mutagen/mutagen"
 else
-    echo "✓ sshfs installed"
+    echo "✓ mutagen installed"
 fi
 
 if ! command -v claude &> /dev/null; then
@@ -102,10 +99,8 @@ echo
 echo "Setup complete!"
 echo
 echo "Usage:"
-echo "  claude-remote          # Launch Claude with remote execution"
-echo "  mount-remote           # Mount remote filesystem only"
-echo "  unmount-remote         # Unmount remote filesystem"
-echo "  sync-start [path]      # Start Mutagen sync for a project"
+echo "  claude-remote          # Launch Claude with remote execution (syncs CWD)"
+echo "  sync-start [path]      # Start Mutagen sync for a directory"
 echo "  sync-status            # Show Mutagen sync status"
 echo "  sync-stop              # Stop Mutagen sync"
 echo "  ssh-tmux               # SSH into remote with tmux"

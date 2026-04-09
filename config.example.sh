@@ -7,5 +7,5 @@ REMOTE_HOST="ubuntu@your-ec2-instance.amazonaws.com"
 # Directory on remote machine where commands will execute
 REMOTE_DIR="/home/ubuntu/Projects"
 
-# Local mount point for remote filesystem
-LOCAL_MOUNT="$HOME/Projects/remote"
+# Root on remote where CWD mirrors are synced (local /abs/path → REMOTE_MIRROR_ROOT/abs/path)
+REMOTE_MIRROR_ROOT="/home/ubuntu/mirror"

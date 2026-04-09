@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 #
-# Start Mutagen sync session
+# Start Mutagen sync session for the current working directory
 # Usage: sync-start [path]
-#   If path is given, syncs just that project directory
-#   If no path, syncs all SYNC_INCLUDE dirs (or entire LOCAL_MOUNT)
+#   Syncs the given path (or CWD) to REMOTE_MIRROR_ROOT/<absolute-path>
 #
 
 # Resolve symlinks to find the real script directory
@@ -70,37 +69,25 @@ create_sync_session() {
     fi
 }
 
-# If a path was passed, resolve it to a project name relative to LOCAL_MOUNT
+# Resolve the target directory
 if [[ -n "$1" ]]; then
     TARGET="$(cd "$1" 2>/dev/null && pwd -P)"
-
-    # Ensure it's under LOCAL_MOUNT
-    if [[ "$TARGET" != "$LOCAL_MOUNT"* ]]; then
-        echo "Error: $TARGET is not under $LOCAL_MOUNT"
-        exit 1
-    fi
-
-    # Get the first path component relative to LOCAL_MOUNT (the project dir)
-    REL="${TARGET#$LOCAL_MOUNT/}"
-    PROJECT="${REL%%/*}"
-
-    if [[ -z "$PROJECT" ]]; then
-        echo "Error: could not determine project from $TARGET"
-        exit 1
-    fi
-
-    create_sync_session "claude-remote-$PROJECT" "$LOCAL_MOUNT/$PROJECT" "$REMOTE_DIR/$PROJECT"
 else
-    # No path given — sync SYNC_INCLUDE list or everything
-    if [[ ${#SYNC_INCLUDE[@]} -gt 0 ]]; then
-        for dir in "${SYNC_INCLUDE[@]}"; do
-            create_sync_session "claude-remote-$dir" "$LOCAL_MOUNT/$dir" "$REMOTE_DIR/$dir"
-        done
-    else
-        mkdir -p "$LOCAL_MOUNT"
-        create_sync_session "claude-remote" "$LOCAL_MOUNT" "$REMOTE_DIR"
-    fi
+    TARGET="$(pwd -P)"
 fi
+
+if [[ -z "$TARGET" || ! -d "$TARGET" ]]; then
+    echo "Error: could not resolve directory: ${1:-$(pwd)}"
+    exit 1
+fi
+
+# Session name: sanitize absolute path into a valid mutagen name
+SESSION_NAME="claude-remote-$(echo "$TARGET" | tr '/' '-' | sed 's/^-//')"
+
+# Remote path: mirror the full local absolute path under REMOTE_MIRROR_ROOT
+REMOTE_PATH="${REMOTE_MIRROR_ROOT}${TARGET}"
+
+create_sync_session "$SESSION_NAME" "$TARGET" "$REMOTE_PATH"
 
 echo "Waiting for sync..."
 mutagen sync flush --label-selector=name=claude-remote

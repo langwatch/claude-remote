@@ -22,14 +22,14 @@ SSH_OPTS="-o ControlMaster=auto -o ControlPath=/tmp/ssh-claude-%r@%h:%p -o Contr
 STATE_FILE="/tmp/claude-remote-state"
 NOTIFY_COOLDOWN=300  # 5 minutes
 
-# Map local path to remote path
+# Map local path to remote path by prepending REMOTE_MIRROR_ROOT
 local_to_remote() {
-    echo "${1/#$LOCAL_MOUNT/$REMOTE_DIR}"
+    echo "${REMOTE_MIRROR_ROOT}${1}"
 }
 
-# Map remote path to local path
+# Map remote path to local path by stripping REMOTE_MIRROR_ROOT prefix
 remote_to_local() {
-    echo "${1/#$REMOTE_DIR/$LOCAL_MOUNT}"
+    echo "${1#$REMOTE_MIRROR_ROOT}"
 }
 
 # Send macOS notification with rate limiting
@@ -92,9 +92,6 @@ if [[ -n "$cmd" ]]; then
 
         REMOTE_CWD="$(local_to_remote "$LOCAL_CWD")"
 
-        # Map local paths in command to remote
-        cmd="${cmd//$LOCAL_MOUNT/$REMOTE_DIR}"
-
         # Flush mutagen sync before command
         mutagen sync flush --label-selector=name=claude-remote >/dev/null 2>&1
 
@@ -126,11 +123,6 @@ if [[ -n "$cmd" ]]; then
     else
         # === LOCAL FALLBACK ===
         notify "Remote unavailable - using local execution" "offline"
-
-        # Map remote paths in command to local (in case command has hardcoded remote paths)
-        cmd="${cmd//$REMOTE_DIR/$LOCAL_MOUNT}"
-        # Also map local paths that might have been transformed
-        cmd="${cmd//$LOCAL_MOUNT/$LOCAL_MOUNT}"  # no-op but keeps consistency
 
         # Run locally
         MARKER="__CLAUDE_LOCAL_PWD__"
