@@ -17,11 +17,20 @@ source "$SCRIPT_DIR/../config.sh" 2>/dev/null || {
     echo "Error: config.sh not found. Run ./setup.sh first." >&2
     exit 1
 }
+source "$SCRIPT_DIR/lib-mode.sh" || {
+    echo "Error: lib-mode.sh not found." >&2
+    exit 1
+}
 
 if [[ -z "$REMOTE_MIRROR_ROOT" ]]; then
     echo "Error: REMOTE_MIRROR_ROOT not set in config.sh" >&2
     exit 1
 fi
+
+# PATH_IDENTITY mode: sync to the identical absolute path on the remote box.
+# When false (legacy), mirror under REMOTE_MIRROR_ROOT.
+# The box-side parent directory (/Users/<user>) must exist and be writable by
+# the ssh user — setup.sh handles this when PATH_IDENTITY is enabled.
 
 # Ensure daemon is running
 mutagen daemon start 2>/dev/null
@@ -57,7 +66,24 @@ create_sync_session() {
     fi
 
     echo "Creating sync: $name ($local_path -> $remote_path)..."
-    ssh -o ConnectTimeout=5 "$REMOTE_HOST" "mkdir -p '$remote_path'" 2>/dev/null
+    if [[ "${PATH_IDENTITY:-false}" == "true" ]]; then
+        # PATH_IDENTITY: remote path is under /Users/... (not user-writable without sudo).
+        # Create the dir via sudo and chown it to the ssh user so mutagen can write.
+        # \$(id -un) and \$(id -gn) are intentionally escaped so they evaluate on the remote box.
+        ssh -o ConnectTimeout=5 "$REMOTE_HOST" "sudo mkdir -p '$remote_path' && sudo chown \$(id -un):\$(id -gn) '$remote_path'"
+    else
+        ssh -o ConnectTimeout=5 "$REMOTE_HOST" "mkdir -p '$remote_path'" 2>/dev/null
+    fi
+
+    # Fail loud: verify the remote path exists before starting a sync session that would
+    # silently succeed but sync nothing.
+    if ! ssh -o ConnectTimeout=5 "$REMOTE_HOST" "test -d '$remote_path'"; then
+        echo "✗ remote path '$remote_path' could not be created on $REMOTE_HOST" >&2
+        echo "  (PATH_IDENTITY mode needs the identity root to exist + be writable; re-run setup.sh or:" >&2
+        echo "   ssh $REMOTE_HOST 'sudo mkdir -p $remote_path && sudo chown <user> $remote_path')" >&2
+        return 1
+    fi
+
     mutagen sync create "$local_path" "$REMOTE_HOST:$remote_path" \
         --name="$name" \
         --label=name=claude-remote \
@@ -87,10 +113,16 @@ if [[ -z "$TARGET" || ! -d "$TARGET" ]]; then
 fi
 
 # Session name: sanitize absolute path into a valid mutagen name (alphanumeric + hyphens only)
-SESSION_NAME="claude-remote-$(echo "$TARGET" | tr -c '[:alnum:]-' '-' | sed 's/^-//;s/-$//')"
+SESSION_NAME="$(_session_name_for "$TARGET")"
 
-# Remote path: mirror the full local absolute path under REMOTE_MIRROR_ROOT
-REMOTE_PATH="${REMOTE_MIRROR_ROOT}${TARGET}"
+# === FIX 1: PATH IDENTITY ===
+# Remote path: when PATH_IDENTITY=true use the identical absolute path on the box;
+# when false (legacy) mirror under REMOTE_MIRROR_ROOT.
+if [[ "${PATH_IDENTITY:-false}" == "true" ]]; then
+    REMOTE_PATH="${TARGET}"
+else
+    REMOTE_PATH="${REMOTE_MIRROR_ROOT}${TARGET}"
+fi
 
 create_sync_session "$SESSION_NAME" "$TARGET" "$REMOTE_PATH"
 
