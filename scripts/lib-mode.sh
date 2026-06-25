@@ -16,6 +16,8 @@
 #      — only consulted when CLAUDE_CODE_SESSION_ID is a well-formed UUID
 #      — malformed (non-empty, non-UUID) id → WARNING to stderr, skip layer
 #      — unset/empty id → skip silently
+#      — file format: line 1 = mode (on|off); optional line 2 = "pid:<owner>"
+#        (a liveness token consumed by session-reap.sh; only line 1 is the mode)
 #   2. project-local  ${CLAUDE_PROJECT_DIR}/.claude-remote-mode
 #      — only consulted when CLAUDE_PROJECT_DIR is set AND file exists
 #   3. global file    ${STATE_DIR}/mode
@@ -29,6 +31,46 @@
 _validate_session_id() {
     local id="${1:-}"
     [[ "$id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]
+}
+
+# _session_owner_pid: print the PID of the durable session-owner process.
+#
+# WHY this exists (the live-state-deletion bug, PR #7):
+#   The per-session mode file is keyed by $CLAUDE_CODE_SESSION_ID, which the
+#   writer reads from its environment. The reaper, however, cannot observe that
+#   UUID at reap time: on macOS it is in NEITHER the session-launcher's argv
+#   ("claude --agent lead …", no --session-id) NOR its `ps eww` environment.
+#   So any argv/env-scraping live-set is always empty for normally-launched
+#   sessions and the reaper deletes the ACTIVE session's file. The fix is to
+#   record a liveness token the reaper CAN observe: the OS pid of the long-lived
+#   `claude`/`node` process that owns the session.
+#
+# Why not $$ or $PPID directly: a Bash tool-call (and thus the toggle) is an
+#   ephemeral `zsh -c …` whose parent ($PPID) is itself a short-lived `zsh -c`
+#   wrapper that exits the instant the call returns. Verified on the dev box:
+#   the toggle's $PPID was 49641 (/bin/zsh -c …), gone moments later; its
+#   grandparent 15140 was the `claude` process that lives for the whole session.
+#   So we walk ancestry up from $PPID to the first claude/node process.
+#
+# Output: the owner PID on success; nothing (empty) if no claude/node ancestor
+#   is found within the walk bound (caller treats empty as "unknown owner").
+# Never fails the caller (no `set -e` surprises): always returns 0.
+_session_owner_pid() {
+    local pid="${PPID:-}"
+    local hops=0
+    local comm
+    while [[ -n "$pid" && "$pid" != "0" && "$pid" != "1" && "$hops" -lt 12 ]]; do
+        comm="$(ps -o comm= -p "$pid" 2>/dev/null)"
+        case "$comm" in
+            *claude*|*node*)
+                printf '%s' "$pid"
+                return 0
+                ;;
+        esac
+        pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+        hops=$(( hops + 1 ))
+    done
+    return 0
 }
 
 # Internal: trim all whitespace from a value
@@ -53,7 +95,11 @@ _resolve_mode() {
         if _validate_session_id "$_sid"; then
             local _sf="${STATE_DIR}/session/${_sid}"
             if [[ -f "$_sf" ]]; then
-                raw="$(< "$_sf")"
+                # Read ONLY the first line: the session file is
+                #   line 1: mode (on|off)
+                #   line 2: pid:<owner>   (liveness token for the reaper; optional)
+                # Legacy single-line files (just "on"/"off") read identically.
+                IFS= read -r raw < "$_sf" || raw=""
                 RESOLVED_MODE_SOURCE="session"
             fi
         else

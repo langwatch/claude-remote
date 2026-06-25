@@ -378,56 +378,117 @@ _rsh() {
 # Reaper: dead session files removed; live ones kept; 2nd run no-op
 # ---------------------------------------------------------------------------
 
-@test "Reaper: removes dead session file, keeps live one, 2nd run is no-op" {
-    local dead_id="dead1234-dead-dead-dead-deaddeaddead"
+# Liveness for the reaper is the OWNER PID recorded on line 2 of the session
+# file ("pid:<n>"), NOT the UUID in some process's argv. These tests exercise
+# that real mechanism with genuine OS processes:
+#   - "alive" owner  = a real backgrounded `sleep` whose pid is live (kill -0 ok)
+#   - "dead"  owner  = a pid we started, killed, and reaped (kill -0 fails)
+# A file claiming a live owner must survive even when aged past the grace
+# window; a file claiming a dead owner (or no owner at all) must be reaped once
+# past the grace window.
+
+# Backdate a session file's mtime past the grace window (macOS or Linux).
+_age_past_grace() {
+    touch -t "$(date -v-120S +%Y%m%d%H%M.%S 2>/dev/null || date -d '-120 seconds' +%Y%m%d%H%M.%S)" \
+        "$1" 2>/dev/null || true
+}
+
+# Print a pid that is guaranteed DEAD: start a process, kill it, reap it.
+_make_dead_pid() {
+    local p
+    sleep 300 & p=$!
+    kill "$p" 2>/dev/null
+    wait "$p" 2>/dev/null
+    printf '%s' "$p"
+}
+
+_run_reap() {
+    PATH="$STUB_BIN:$PATH" \
+    CLAUDE_REMOTE_STATE_DIR="$STATE_DIR" \
+    bash "$SESSION_REAP"
+}
+
+@test "Reaper: keeps file with LIVE owner pid, reaps file with DEAD owner pid, 2nd run no-op" {
     local live_id="$VALID_SID"
+    local dead_id="dead1234-dead-dead-dead-deaddeaddead"
+
+    # A real live owner process for the live file.
+    local alive_pid
+    sleep 300 & alive_pid=$!
+
+    # A guaranteed-dead owner for the dead file.
+    local dead_pid
+    dead_pid="$(_make_dead_pid)"
 
     mkdir -p "$STATE_DIR/session"
-    printf 'on\n' > "$STATE_DIR/session/$dead_id"
-    printf 'on\n' > "$STATE_DIR/session/$live_id"
+    printf 'on\npid:%s\n' "$alive_pid" > "$STATE_DIR/session/$live_id"
+    printf 'on\npid:%s\n' "$dead_pid"  > "$STATE_DIR/session/$dead_id"
 
-    # Age the dead file past the 60s grace window by backdating its mtime
-    touch -t "$(date -v-120S +%Y%m%d%H%M.%S 2>/dev/null || date -d '-120 seconds' +%Y%m%d%H%M.%S)" \
-        "$STATE_DIR/session/$dead_id" 2>/dev/null || true
-    # Also backdate the live file to be safe (reaper should keep it regardless of age)
-    touch -t "$(date -v-120S +%Y%m%d%H%M.%S 2>/dev/null || date -d '-120 seconds' +%Y%m%d%H%M.%S)" \
-        "$STATE_DIR/session/$live_id" 2>/dev/null || true
+    # Age BOTH past the grace window: liveness must come from kill -0, not age.
+    _age_past_grace "$STATE_DIR/session/$live_id"
+    _age_past_grace "$STATE_DIR/session/$dead_id"
 
-    # Stub ps: reports the live id in argv, not the dead id
-    cat > "$STUB_BIN/ps" <<PSEOF
-#!/usr/bin/env bash
-echo "claude --session-id $live_id --dangerously-skip-permissions"
-echo "bash /some/other/process"
-PSEOF
-    chmod +x "$STUB_BIN/ps"
+    _run_reap
 
-    # Run reaper with stubbed ps
-    local reap_out
-    reap_out="$(
-        PATH="$STUB_BIN:$PATH" \
-        CLAUDE_REMOTE_STATE_DIR="$STATE_DIR" \
-        CLAUDE_REMOTE_PS_BIN="$STUB_BIN/ps" \
-        bash "$SESSION_REAP"
-    )"
-
-    # Dead file must be gone
+    # Live-owner file survives despite being old; dead-owner file is gone.
+    [[ -f "$STATE_DIR/session/$live_id" ]]
     [[ ! -f "$STATE_DIR/session/$dead_id" ]]
-    # Live file must remain
-    [[ -f "$STATE_DIR/session/$live_id" ]]
 
-    # 2nd run: no-op (dead already gone, live still present)
+    # 2nd run is a no-op: live still present, nothing left to reap.
     local reap_out2
-    reap_out2="$(
-        PATH="$STUB_BIN:$PATH" \
-        CLAUDE_REMOTE_STATE_DIR="$STATE_DIR" \
-        CLAUDE_REMOTE_PS_BIN="$STUB_BIN/ps" \
-        bash "$SESSION_REAP"
-    )"
-
-    # Live file still present after 2nd run
+    reap_out2="$(_run_reap)"
     [[ -f "$STATE_DIR/session/$live_id" ]]
-    # 2nd run output should report 0 reaped
     [[ "$reap_out2" == *"reaped 0"* ]]
+
+    kill "$alive_pid" 2>/dev/null || true
+}
+
+@test "Reaper: legacy file (no pid line) past grace is reaped" {
+    # Files written before the PID fix have no observable owner — genuine
+    # orphans. Past the grace window they must be reaped (mirrors the stale
+    # Jun-17 files that motivated this fix).
+    local legacy_id="$VALID_SID"
+
+    mkdir -p "$STATE_DIR/session"
+    printf 'on\n' > "$STATE_DIR/session/$legacy_id"
+    _age_past_grace "$STATE_DIR/session/$legacy_id"
+
+    _run_reap
+
+    [[ ! -f "$STATE_DIR/session/$legacy_id" ]]
+}
+
+@test "Reaper: dead-owner file INSIDE grace window survives (TOCTOU guard)" {
+    # A file just written (young) whose owner pid is already dead must still be
+    # spared — the grace window guards the write-mid-reap race.
+    local young_id="$VALID_SID"
+
+    local dead_pid
+    dead_pid="$(_make_dead_pid)"
+
+    mkdir -p "$STATE_DIR/session"
+    printf 'on\npid:%s\n' "$dead_pid" > "$STATE_DIR/session/$young_id"
+    # Do NOT backdate — file is fresh, inside the 60s grace window.
+
+    local reap_out
+    reap_out="$(_run_reap)"
+
+    [[ -f "$STATE_DIR/session/$young_id" ]]
+    [[ "$reap_out" == *"reaped 0"* ]]
+}
+
+@test "Reaper: mode line 1 still resolves correctly with a pid line present" {
+    # The two-line format must not break mode resolution: line 1 is the mode,
+    # line 2 (pid:) is liveness metadata only.
+    mkdir -p "$STATE_DIR/session"
+    printf 'off\npid:12345\n' > "$STATE_DIR/session/$VALID_SID"
+
+    # Resolve via the canonical resolver in lib-mode.sh.
+    run env -u CLAUDE_PROJECT_DIR -u CLAUDE_REMOTE_MODE \
+        CLAUDE_REMOTE_STATE_DIR="$STATE_DIR" \
+        CLAUDE_CODE_SESSION_ID="$VALID_SID" \
+        bash -c 'STATE_DIR="$CLAUDE_REMOTE_STATE_DIR"; CLAUDE_PROJECT_DIR="${CLAUDE_PROJECT_DIR:-}"; CLAUDE_REMOTE_MODE="${CLAUDE_REMOTE_MODE:-}"; source "'"$REPO_ROOT"'/scripts/lib-mode.sh"; printf "%s|%s" "$(_resolve_mode)" "$(_resolve_mode_source)"'
+    [[ "$output" == "off|session" ]]
 }
 
 # ===========================================================================

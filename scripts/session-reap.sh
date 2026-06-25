@@ -3,16 +3,33 @@
 # session-reap.sh — remove stale per-session mode files from
 #                   ${STATE_DIR}/session/<uuid>
 #
-# A session file is stale when its UUID is NOT present in the process table
-# (no live `claude ... --session-id <uuid>` process).
+# Liveness signal — why a PID, not the UUID:
+#   Each session file is keyed by the session UUID, which the writer
+#   (toggle.sh) reads from $CLAUDE_CODE_SESSION_ID in its environment. The
+#   reaper cannot observe that UUID at reap time: on macOS the session-launcher
+#   process ("claude --agent lead …") carries the UUID in NEITHER its argv NOR
+#   its `ps eww` environment, so any argv/env-scraping live-set is empty for
+#   normally-launched sessions — and the reaper then deletes the ACTIVE
+#   session's file, silently reverting offload to local mid-session.
 #
-# TOCTOU grace-window: only reap files older than 60 seconds.  A session
-# that is starting mid-reap will have a file that is ≤60s old; we leave it.
-# A dead session's file will be >60s old once the process has gone.
+#   Instead, the writer records a liveness token the reaper CAN observe: the OS
+#   pid of the long-lived `claude`/`node` process that owns the session
+#   (see _session_owner_pid in lib-mode.sh). This file holds:
+#       line 1: mode  (on|off)        — read by lib-mode.sh
+#       line 2: pid:<owner>           — read here; the liveness token
+#   A session is LIVE iff `kill -0 <owner>` succeeds. This is UUID-independent
+#   and ps-format-independent.
 #
-# Live-set derivation: parse `ps -eo command` for `--session-id <uuid>`.
-# This is the process table — not transcripts, not socket files — so it is
-# authoritative for running processes.
+# TOCTOU grace-window: only reap files older than 60 seconds. This is a
+#   SECONDARY guard for the narrow race where a file is written mid-reap (its
+#   owner pid not yet flushed, or the file just created). Primary protection for
+#   live sessions is the kill -0 check, not the age.
+#
+# Legacy files: files with no "pid:" line (written before this fix) have no
+#   observable owner, so they are treated as dead candidates and reaped once
+#   past the grace window. This is correct — they are genuine orphans.
+#
+# macOS/Linux: mtime via stat -f %m (macOS) with fallback to stat -c %Y (Linux).
 #
 # Idempotent: a second run on the same state is a no-op (exit 0).
 #
@@ -42,22 +59,27 @@ fi
 
 GRACE_SECONDS=60
 
-# Build the live set: UUIDs of running claude processes
-# ps -eo command prints one line per process with the full command string.
-# We extract every --session-id argument that looks like a UUID.
-# Indirection: CLAUDE_REMOTE_PS_BIN lets tests stub ps.
-PS_BIN="${CLAUDE_REMOTE_PS_BIN:-ps}"
-
-live_ids=""
-while IFS= read -r cmdline; do
-    # Extract value after --session-id (next word)
-    if [[ "$cmdline" =~ --session-id[[:space:]]+([^[:space:]]+) ]]; then
-        candidate="${BASH_REMATCH[1]}"
-        if _validate_session_id "$candidate"; then
-            live_ids="${live_ids}${candidate}"$'\n'
+# _owner_pid_of <file> — print the owner pid recorded on line 2 ("pid:<n>"),
+# or nothing if absent/malformed. Only the FIRST pid: line is honoured.
+_owner_pid_of() {
+    local f="$1" line pid=""
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^pid:([0-9]+)$ ]]; then
+            pid="${BASH_REMATCH[1]}"
+            break
         fi
-    fi
-done < <("$PS_BIN" -eo command 2>/dev/null)
+    done < "$f"
+    printf '%s' "$pid"
+}
+
+# _owner_alive <file> — exit 0 if the file records a live owner pid, 1 otherwise.
+# No pid line, malformed pid, or a dead pid → not alive (1).
+_owner_alive() {
+    local pid
+    pid="$(_owner_pid_of "$1")"
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
 
 reaped=0
 now="$(date +%s)"
@@ -73,8 +95,14 @@ for sf in "$SESSION_DIR"/*; do
         continue
     fi
 
-    # Grace-window: skip files younger than GRACE_SECONDS
-    # Use stat -f %m (macOS) with fallback to stat -c %Y (Linux)
+    # Primary liveness check: owner process still running → keep, regardless of age.
+    if _owner_alive "$sf"; then
+        continue
+    fi
+
+    # Owner is dead or unknown. Apply the TOCTOU grace-window: skip files
+    # younger than GRACE_SECONDS (just-written file whose owner token may not be
+    # flushed yet, or a session starting mid-reap).
     if mtime=$(stat -f %m "$sf" 2>/dev/null) || mtime=$(stat -c %Y "$sf" 2>/dev/null); then
         age=$(( now - mtime ))
         if (( age < GRACE_SECONDS )); then
@@ -82,14 +110,9 @@ for sf in "$SESSION_DIR"/*; do
         fi
     fi
 
-    # Check if this id is in the live set
-    if printf '%s' "$live_ids" | grep -qxF "$fname"; then
-        : # live session — leave it
-    else
-        rm -f "$sf"
-        echo "session-reap: removed stale session file ${fname}"
-        reaped=$(( reaped + 1 ))
-    fi
+    rm -f "$sf"
+    echo "session-reap: removed stale session file ${fname}"
+    reaped=$(( reaped + 1 ))
 done
 
 echo "session-reap: done (reaped ${reaped} session file(s))"
