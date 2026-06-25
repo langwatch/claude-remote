@@ -10,3 +10,4 @@ config.sh
 *~
 .idea/
 .vscode/
+.worktrees/

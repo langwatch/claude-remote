@@ -18,18 +18,74 @@ source "$SCRIPT_DIR/../config.sh" 2>/dev/null || {
     exit 1
 }
 
+if [[ -z "$REMOTE_MIRROR_ROOT" ]]; then
+    echo "Error: REMOTE_MIRROR_ROOT not set in config.sh" >&2
+    exit 1
+fi
+
+# === MODE TOGGLE (file-backed, per-call) ===
+# Precedence (session > project-local > global > env seed > default "on").
+# Fail-safe: ANYTHING other than exactly "on" or "off" defaults to LOCAL and
+# emits a warning.  A corrupt toggle must NEVER silently SSH to a box.
+# Logic lives in lib-mode.sh; sourced here so the gate and the CLI share one copy.
+STATE_DIR="${CLAUDE_REMOTE_STATE_DIR:-$HOME/.claude-remote}"
+source "$SCRIPT_DIR/lib-mode.sh" || {
+    echo "[claude-remote] ERROR: lib-mode.sh not found — cannot resolve mode" >&2
+    exit 1
+}
+
+_RESOLVED_MODE="$(_resolve_mode)"
+
+# Apply mode — fail-safe: anything that is not exactly "on" routes local
+FORCE_LOCAL=0
+case "$_RESOLVED_MODE" in
+    on)
+        : # fall through to normal remote-availability check
+        ;;
+    off)
+        FORCE_LOCAL=1
+        ;;
+    *)
+        FORCE_LOCAL=1
+        echo "[claude-remote] WARNING: unrecognized mode '${_RESOLVED_MODE}' — defaulting to local (off)" >&2
+        ;;
+esac
+
+# === URL OVERRIDE (file-backed) ===
+# _resolve_url returns the url-file value (trimmed) when present and non-empty,
+# otherwise the config.sh REMOTE_HOST.  Assign unconditionally — it is safe
+# because the fallback value IS the current REMOTE_HOST.
+# AC11: empty/whitespace url file → _resolve_url returns config.sh value → no change.
+REMOTE_HOST="$(_resolve_url)"
+
 SSH_OPTS="-o ControlMaster=auto -o ControlPath=/tmp/ssh-claude-%r@%h:%p -o ControlPersist=600 -o ConnectTimeout=5"
 STATE_FILE="/tmp/claude-remote-state"
 NOTIFY_COOLDOWN=300  # 5 minutes
 
+# Indirection so tests can inject a stub without touching PATH.
+# Production default is /usr/bin/ssh; tests set CLAUDE_REMOTE_SSH=$STUB_BIN/ssh.
+SSH_BIN="${CLAUDE_REMOTE_SSH:-/usr/bin/ssh}"
+
+# === FIX 1: PATH IDENTITY ===
+# When PATH_IDENTITY=true, local and remote paths are identical (no translation).
+# When false (legacy), prepend/strip REMOTE_MIRROR_ROOT as before.
+
 # Map local path to remote path
 local_to_remote() {
-    echo "${1/#$LOCAL_MOUNT/$REMOTE_DIR}"
+    if [[ "${PATH_IDENTITY:-false}" == "true" ]]; then
+        echo "$1"
+    else
+        echo "${REMOTE_MIRROR_ROOT}${1}"
+    fi
 }
 
 # Map remote path to local path
 remote_to_local() {
-    echo "${1/#$REMOTE_DIR/$LOCAL_MOUNT}"
+    if [[ "${PATH_IDENTITY:-false}" == "true" ]]; then
+        echo "$1"
+    else
+        echo "${1#$REMOTE_MIRROR_ROOT}"
+    fi
 }
 
 # Send macOS notification with rate limiting
@@ -52,19 +108,41 @@ notify() {
     fi
 }
 
+# Pick a usable timeout binary (macOS lacks `timeout` by default).
+# If neither exists, run the command without a wrapper — SSH's own
+# ConnectTimeout still bounds it.
+if command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_BIN=timeout
+elif command -v gtimeout >/dev/null 2>&1; then
+    TIMEOUT_BIN=gtimeout
+else
+    TIMEOUT_BIN=""
+fi
+_timeout() {
+    local secs="$1"; shift
+    if [[ -n "$TIMEOUT_BIN" ]]; then
+        "$TIMEOUT_BIN" "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
 # Check if remote is reachable (fast check with hard timeout)
 is_remote_available() {
     # First check if control socket exists but is stale
     local socket="/tmp/ssh-claude-${REMOTE_HOST}:22"
     if [[ -S "$socket" ]]; then
         # Test if socket is alive, remove if stale
-        if ! timeout 1 /usr/bin/ssh -o ControlPath="$socket" -O check "$REMOTE_HOST" 2>/dev/null; then
+        if ! _timeout 1 "$SSH_BIN" -o ControlPath="$socket" -O check "$REMOTE_HOST" 2>/dev/null; then
             /bin/rm -f "$socket" 2>/dev/null
         fi
     fi
     # Plain SSH check without ControlMaster (ControlMaster=auto can hang when creating socket)
-    timeout 5 /usr/bin/ssh -o ConnectTimeout=5 -o BatchMode=yes "$REMOTE_HOST" "exit 0" 2>/dev/null
+    _timeout 5 "$SSH_BIN" -o ConnectTimeout=5 -o BatchMode=yes "$REMOTE_HOST" "exit 0" 2>/dev/null
 }
+
+# _session_name_for is imported from lib-mode.sh (already sourced above).
+# Used to scope mutagen flush to this repo only.
 
 # Parse flags - Claude Code sends: -c -l "command"
 while [[ $# -gt 0 ]]; do
@@ -85,30 +163,41 @@ if [[ -n "$cmd" ]]; then
 
     LOCAL_CWD="$(pwd -P)"
 
-    # Check remote availability
-    if is_remote_available; then
+    # Session name scoped to this directory
+    SESSION_NAME="$(_session_name_for "$LOCAL_CWD")"
+
+    # Check remote availability — skip if mode=off
+    if [[ "$FORCE_LOCAL" -eq 0 ]] && is_remote_available; then
         # === REMOTE EXECUTION ===
         notify "Remote instance available" "online"
 
         REMOTE_CWD="$(local_to_remote "$LOCAL_CWD")"
 
-        # Map local paths in command to remote
-        cmd="${cmd//$LOCAL_MOUNT/$REMOTE_DIR}"
+        # === FIX 3: Flush only this repo's sync session before command ===
+        mutagen sync flush "$SESSION_NAME" >/dev/null 2>&1
 
-        # Flush mutagen sync before command
-        mutagen sync flush --label-selector=name=claude-remote >/dev/null 2>&1
+        # === FIX 1: .git rewrite block — only needed in legacy (non-identity) mode ===
+        if [[ "${PATH_IDENTITY:-false}" != "true" ]]; then
+            "$SSH_BIN" $SSH_OPTS "$REMOTE_HOST" "
+                if [ -f '$REMOTE_CWD/.git' ] && grep -q 'gitdir:' '$REMOTE_CWD/.git'; then
+                    if ! grep -q 'gitdir: ${REMOTE_MIRROR_ROOT}' '$REMOTE_CWD/.git'; then
+                        sed -i 's|gitdir: /|gitdir: ${REMOTE_MIRROR_ROOT}/|' '$REMOTE_CWD/.git'
+                    fi
+                fi
+            " 2>/dev/null || true
+        fi
 
         # Build remote command
         # Source .profile and .bashrc (with non-interactive guard disabled)
         MARKER="__CLAUDE_REMOTE_PWD__"
-        remote_cmd="source ~/.profile 2>/dev/null; source <(sed 's/return;;/;;/' ~/.bashrc) 2>/dev/null; cd '$REMOTE_CWD' 2>/dev/null || cd '$REMOTE_DIR'; /bin/bash -c $(printf '%q' "$cmd"); echo $MARKER; pwd -P"
+        remote_cmd="source ~/.profile 2>/dev/null; source <(sed 's/return;;/;;/' ~/.bashrc) 2>/dev/null; cd '$REMOTE_CWD'; /bin/bash -c $(printf '%q' "$cmd"); echo $MARKER; pwd -P"
 
         # Run and capture output
-        remote_output=$(/usr/bin/ssh $SSH_OPTS "$REMOTE_HOST" "$remote_cmd")
+        remote_output=$("$SSH_BIN" $SSH_OPTS "$REMOTE_HOST" "$remote_cmd")
         exit_code=$?
 
-        # Flush mutagen sync after command
-        mutagen sync flush --label-selector=name=claude-remote >/dev/null 2>&1
+        # === FIX 3: Flush only this repo's sync session after command ===
+        mutagen sync flush "$SESSION_NAME" >/dev/null 2>&1
 
         # Split output and handle pwd
         if [[ "$remote_output" == *"$MARKER"* ]]; then
@@ -124,13 +213,14 @@ if [[ -n "$cmd" ]]; then
             [[ -n "$pwd_file" ]] && echo "$LOCAL_CWD" > "$pwd_file"
         fi
     else
-        # === LOCAL FALLBACK ===
-        notify "Remote unavailable - using local execution" "offline"
-
-        # Map remote paths in command to local (in case command has hardcoded remote paths)
-        cmd="${cmd//$REMOTE_DIR/$LOCAL_MOUNT}"
-        # Also map local paths that might have been transformed
-        cmd="${cmd//$LOCAL_MOUNT/$LOCAL_MOUNT}"  # no-op but keeps consistency
+        # === LOCAL EXECUTION (mode=off or remote unavailable) ===
+        # === FIX 4b: Loud stderr marker so Claude sees the fallback ===
+        if [[ "$FORCE_LOCAL" -eq 1 ]]; then
+            echo "[claude-remote] LOCAL EXECUTION — MODE=off, running on Mac" >&2
+        else
+            notify "Remote unavailable - using local execution" "offline"
+            echo "[claude-remote] LOCAL FALLBACK — remote $REMOTE_HOST unreachable, running on Mac" >&2
+        fi
 
         # Run locally
         MARKER="__CLAUDE_LOCAL_PWD__"
@@ -153,12 +243,16 @@ if [[ -n "$cmd" ]]; then
     exit $exit_code
 else
     # Interactive shell
-    if is_remote_available; then
+    if [[ "$FORCE_LOCAL" -eq 0 ]] && is_remote_available; then
         notify "Remote instance available" "online"
         REMOTE_CWD="$(local_to_remote "$(pwd -P)")"
-        /usr/bin/ssh $SSH_OPTS -t "$REMOTE_HOST" "cd '$REMOTE_CWD' 2>/dev/null || cd '$REMOTE_DIR'; /bin/bash -l"
+        "$SSH_BIN" $SSH_OPTS -t "$REMOTE_HOST" "cd '$REMOTE_CWD'; /bin/bash -l"
     else
-        notify "Remote unavailable - using local shell" "offline"
+        if [[ "$FORCE_LOCAL" -eq 1 ]]; then
+            echo "[claude-remote] LOCAL EXECUTION — MODE=off, running on Mac" >&2
+        else
+            notify "Remote unavailable - using local shell" "offline"
+        fi
         /bin/bash -l
     fi
 fi

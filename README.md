@@ -19,8 +19,8 @@ Run Claude Code locally with the UI on your machine, but execute all commands on
 │         │                                          │                │
 │         ▼                                          │                │
 │  ┌──────────────┐    ┌──────────────┐              │                │
-│  │ ~/Projects/  │◀──▶│   Mutagen    │◀─────────────┼────────┐      │
-│  │   remote/    │    │ (bidirectional sync)        │        │      │
+│  │ Any local    │◀──▶│   Mutagen    │◀─────────────┼────────┐      │
+│  │  directory   │    │ (bidirectional sync)        │        │      │
 │  └──────────────┘    └──────────────┘              │        │      │
 └────────────────────────────────────────────────────┼────────┼──────┘
                                                      │        │
@@ -28,7 +28,7 @@ Run Claude Code locally with the UI on your machine, but execute all commands on
 ┌────────────────────────────────────────────────────────────────────┐
 │                      Remote Server (EC2)                           │
 │  ┌──────────────┐    ┌──────────────────────────────────────┐     │
-│  │   SSH        │    │  /home/ubuntu/Projects/               │     │
+│  │   SSH        │    │  REMOTE_MIRROR_ROOT/<abs-path>/       │     │
 │  │   Server     │───▶│  (your actual files & execution)     │     │
 │  └──────────────┘    └──────────────────────────────────────┘     │
 └────────────────────────────────────────────────────────────────────┘
@@ -109,11 +109,8 @@ ssh-copy-id ubuntu@your-server.com
 ## Usage
 
 ```bash
-# Launch Claude with remote execution (uses DEFAULT_PROJECT from config)
+# Launch Claude with remote execution (syncs current directory)
 claude-remote
-
-# Or specify a path
-claude-remote ~/Projects/remote/my-project
 ```
 
 Once running, all Claude commands execute on the remote server:
@@ -133,7 +130,6 @@ Linux ip-10-0-3-248 6.14.0-1018-aws ... aarch64 GNU/Linux
 sync-start       # Start Mutagen sync (auto-started by claude-remote)
 sync-stop        # Stop Mutagen sync
 sync-status      # Check sync status
-ssh-tmux         # SSH into remote with persistent tmux session
 ```
 
 ## Configuration
@@ -141,18 +137,88 @@ ssh-tmux         # SSH into remote with persistent tmux session
 Edit `config.sh` (created by setup.sh):
 
 ```bash
-# SSH connection to remote machine
 REMOTE_HOST="ubuntu@your-ec2-instance.amazonaws.com"
-
-# Directory on remote machine where commands will execute
-REMOTE_DIR="/home/ubuntu/Projects"
-
-# Local directory to sync with remote
-LOCAL_MOUNT="$HOME/Projects/remote"
-
-# Default project directory (optional, defaults to LOCAL_MOUNT)
-DEFAULT_PROJECT="$LOCAL_MOUNT/my-project"
+REMOTE_MIRROR_ROOT="/home/ubuntu/claude-remote-mirror"
+PATH_IDENTITY="false"   # set to "true" for identity-path mode (see below)
 ```
+
+### PATH_IDENTITY mode
+
+When `PATH_IDENTITY="true"`, files are synced to the **identical absolute path** on the remote box instead of being mirrored under `REMOTE_MIRROR_ROOT`. For example, `/Users/USER/workspace/myproject` on the Mac syncs to `/Users/USER/workspace/myproject` on the box — no path translation at all.
+
+Benefits: git worktrees just work (no `.git` file rewriting needed), and any tool that embeds absolute paths in its output is correct on both sides without translation.
+
+Requirements: the box must have `/Users/<localuser>` created and owned by the ssh user. `setup.sh` does this automatically when you answer `y` to the PATH_IDENTITY prompt. To do it manually:
+
+```bash
+# On the box (as a user with sudo):
+sudo mkdir -p /Users/<localuser> && sudo chown ubuntu:ubuntu /Users /Users/<localuser>
+```
+
+`/Users` on the box is a plain directory — no bind-mount or special setup needed.
+
+**Note:** only the directory you run `claude-remote` from is synced. One mutagen session is created per launch directory. Paths outside that tree are not present on the box.
+
+### Toggling offload on/off
+
+Toggling is driven by a companion **`/claude-remote` skill** that lives in your Claude Code skills directory at `~/.claude/skills/claude-remote/` (it ships separately from this repo). Once that skill is present, toggle from inside any Claude Code session:
+
+```
+/claude-remote on     # write per-session mode=on
+/claude-remote off    # write per-session mode=off
+/claude-remote status # print resolved mode, source, and url
+```
+
+Because `remote-shell.sh` is re-executed on every Bash tool call, the toggle takes effect on the **next command** — no Claude restart needed.
+
+**Scope default is per-session:** `on`/`off` write a **per-session** file (not global). This means toggling on in one session does not affect other sessions. To set a persistent default, write the global file directly: `printf 'on\n' > ~/.claude-remote/mode`.
+
+**How the toggle works (file-backed):** Claude Code re-execs `$SHELL` per Bash call, so environment variables set by a child shell are lost by the next call. The toggle writes a file that is re-read on every call instead:
+
+```
+~/.claude-remote/session/<id>  — per-session on|off (highest precedence)
+~/.claude-remote/mode          — global on|off
+~/.claude-remote/url           — ssh host string (e.g. ubuntu@10.0.3.56)
+```
+
+**Mode precedence (highest first):**
+1. Per-session file `~/.claude-remote/session/<CLAUDE_CODE_SESSION_ID>`
+2. Project-local file `$CLAUDE_PROJECT_DIR/.claude-remote-mode` (if `CLAUDE_PROJECT_DIR` is set)
+3. Global file `~/.claude-remote/mode`
+4. Env var `$CLAUDE_REMOTE_MODE` (launch-time seed — cannot change mid-session)
+5. Built-in default: `on`
+
+**Fail-safe:** any value other than exactly `on` routes **locally** and emits a warning to stderr. A corrupt toggle file can never silently SSH to a box.
+
+**Wraps-not-activates:** when `claude-remote` launches, if `~/.claude-remote/mode` does not yet exist, the launcher seeds it with `off`. This means a fresh install is locally passthrough until you explicitly toggle on.
+
+**Project-local override:** drop a `.claude-remote-mode` file in your project root (containing `on` or `off`) to override the global setting for that project only.
+
+#### CLAUDE_REMOTE_MODE env var
+
+The env var is still honoured as a **launch-time seed** (precedence step 4 above). It cannot toggle mid-session because child-shell exports do not survive across Bash calls:
+
+```bash
+# These do NOT toggle mid-session (child export is gone next call):
+export CLAUDE_REMOTE_MODE=off    # ineffective after first Bash call
+export CLAUDE_REMOTE_MODE=on
+
+# Use the /claude-remote skill instead (inside a Claude session):
+# /claude-remote off
+# /claude-remote on
+```
+
+### Scoped sync sessions
+
+Each `claude-remote` launch creates exactly one mutagen session for the launch directory. The session name is derived from the directory path (e.g. `claude-remote--Users-localuser-workspace-myproject`). Only that session is flushed before and after each remote command — other projects running in parallel are unaffected.
+
+To clear zombie (halted/disconnected) sessions:
+
+```bash
+sync-reap
+```
+
+This lists all `claude-remote`-labelled sessions and terminates any whose status is Halted/Disconnected/errored or whose local alpha path no longer exists. Healthy sessions are left untouched.
 
 ### Sync ignore patterns
 
